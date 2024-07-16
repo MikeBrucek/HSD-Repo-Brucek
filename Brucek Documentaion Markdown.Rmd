@@ -1,0 +1,755 @@
+---
+title: "HopSkipDrive Documentation"
+author: "Mike Brucek"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: yes
+    toc_float:
+      collapsed: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, error = FALSE, message = FALSE)
+```
+
+<br>
+<br>
+
+# Overall Recommendation
+
+<br>
+
+The solution to optimizing boost rates with respect to overall price requires a nuanced approach that combines predictive modeling, linear optimization, and an understanding of driver psychology.
+
+The first step involves predicting the final price of a ride using the initial feature set. This prediction, with consideration of the error margins, will help define a search space for calibrating various charges, including boost rate. This step sets the groundwork for further optimization, ensuring that all factors affecting the total price are taken into account. More simply stated, this step helps define the constraints for a linear optimization approach.
+
+Applying a linear optimization function to this predicted search space is the recommended approach. Linear optimization is a mathematical technique used to find the best outcome in a given model by maximizing or minimizing a specific outcome, subject to a set of linear constraints. In our case, we can aim to minimize the boost rate within the predictive window potential rates from the earlier step. Constraints could be a number of factors, such as time to claim and total price.
+
+We should attempt to prevent drivers from recognizing and exploiting patterns by incorporating a level of randomness into the final model or models. This randomness would not be arbitrary, but strategically designed to maintain the effectiveness of the boost strategy, ensuring that drivers remain engaged and responsive to the changes. We should consider adding randomness and/or controls in three specific ways: the step in the boost sequence, the time lapse between boosts, and the amount.
+
+Testing Boost decreases earlier in the sequence may expedite claimed rides. Our exploratory analysis revealed that 55% of the claimed rides took place after a decrease in boost was offered. Drivers may be assuming the peak benefit has been reached and act quickly to secure the ride. Calibrating the randomness to ensure these decreases are tested earlier in the boosting sequences leverages this behavior.
+
+Evaluating individual drivers and their tendencies is another key aspect. Some drivers may react more favorably to boost decreases compared to others. When drivers who accept boost offers at the first sign of decrease should be noted. When these drivers are more present in the driver pool, the likelihood of implementing boost decreases should be higher. Conversely, with a pool dominated by less predictable drivers, the focus should shift to adjusting the boost amount upward rather than focus on its polarity. This tailored approach ensures that the Boost strategy is adaptable to the varying behaviors within the driver pool.
+
+This multifaceted approach combines predictive modeling, strategic randomness, and driver-specific insights to optimize the boost process and decrease the time to a claimed ride, all while respecting the desire to minimize the total price.
+
+<br>
+
+## Executive Summary: Exploratory Analysis
+
+These points are the key takeaways from the process. Code and commentary are repeated in the Knowledge Transfer section of this documentation.
+
+### General Exploration 
+
+* No missing values 
+* Two timestamp elements that may need to be reshaped for later use 
+* Location is the only character element 
+* The "total price" appears to be greater than the "base_plus_boost", suggesting there is some sort of hidden fee 
+  + The hidden charge doesn't kick in until after the 2nd boost 
+
+
+**Next Steps:**
+
+* Create elements that allow us to explore the hidden fees 
+* Create elements that reveal how the various fees evolve throughout the boosting process 
+
+<br>
+
+### Location 
+
+* Trips appear to be broken out uniformly across locations 
+* The average number of boosts seems uniform across locations 
+* The average costs has very little fluctuation between markets 
+
+<br>
+
+### Boost Rate 
+
+* The number of boosts range from 0 to 10 
+* Trips are uniformly distributed across a breakout of number of boosts 
+* All of the trips that went unclaimed did not receive any boosting 
+* Similarly, trips were exclusively claimed after boosting (never before) 
+* Not all of the boosts are positive 
+* The negative boosts seem to be distributed fairly consistently across the sequences at roughly 50% 
+* Negative boosts account for half of the total boosts 
+  + 55% of rides were claimed after the boost rate decreased 
+  + It appears that drivers are **MORE** likely to claim a ride after a negative boost that a positive boost 
+* The distribution of claimed rides after a negative boost appears to be uniformly distributed throughout the boosting sequence 
+* Both single boost decreases and consecutive boost decreases appear to have similar claim rates, suggesting that dropping a boost multiple times in a row has little to no effect on claim rates 
+
+<br>
+
+### Modeling
+
+Three independent models were created for testing and experimentation - two ML models and a basic linear optimization model. Given time constraints and the intention to discuss this documentation in a live setting, I am providing code for what was completed in the Knowledge Transfer section with the intention of explaining and summarizing in conversation. Any notes related to the reasoning for taking the approach will be provided there as well. 
+
+
+\newpage
+<br>
+<br>
+<br>
+
+# Knowledge Transfer - Exploratory Analysis
+<br>
+
+## Data Setup
+<br>
+
+For ease of reading, these steps are presented in a single block for review, despite each data frame being created on demand as the EDA process called for new perspectives.  
+<br>
+
+```{r, results='hide'}
+library(tidyverse)
+library(reshape2) # for melt
+library(janitor)  # for adorned rows
+
+setwd("C:\\Users\\MichaelBrucek\\Desktop\\HSD Task")
+
+
+
+# Read and Explore Data ----
+data = read.csv("boost_df.csv")
+
+
+# Convert data types for ease of use
+data$timestamp = lubridate::as_datetime(data$timestamp)
+data$trip_start_date = lubridate::as_datetime(data$trip_start_date)
+
+      
+
+# Add elements that help understand the data ----
+data_2 = data %>%
+  mutate(hidden_charges = total_price - base_plus_boost,  # Reveal hidden charges (base + boost does not always == total_price)
+         hours_from_boost_to_ride = as.numeric(trip_start_date - timestamp) * 24) %>%  #Understand the lapse between the boost dates and the strip_start_date
+  # reorder for easier interpretation
+  select(c(trip_id, metro_area, trip_start_date, timestamp, hours_from_boost_to_ride,
+           boost_number, base_price, boost_amount, base_plus_boost, base_plus_boost, 
+           hidden_charges, total_price, claimed, total_driver_supply))
+
+      
+
+
+## Explore Trips ----
+trip_summary = data_2 %>%
+  group_by(trip_id) %>% 
+  summarise(metro_area = max(metro_area),
+            number_of_boosts = n() - 1,
+            unclaimed_trip = ifelse(sum(claimed)==0, 1, 0),
+            starting_rate = min(total_price),
+            ending_rate = max(total_price),
+            total_price_change = ending_rate - starting_rate,
+            total_drives_when_claimed = ifelse(max(claimed) == 1, 
+                                               total_driver_supply[claimed==1],
+                                               total_driver_supply)
+  )
+      
+      
+# Add percentage increase stats to better understand how these elements move together
+data_3 = data_2 %>%
+  group_by(trip_id) %>%
+  mutate(
+    boost_amount_pct_of_total = (boost_amount / total_price) * 100,
+    boost_pct_increase = ifelse(boost_number < 2, 0, (boost_amount - lag(boost_amount)) / lag(boost_amount) * 100),
+    boost_pct_increase = ifelse(is.na(boost_pct_increase), 0, boost_pct_increase),
+       # Hidden charge doesn't kick in until after the 2nd boost                            
+    hidden_charge_pct_of_total = (hidden_charges / total_price) * 100,
+    hidden_charge_pct_increase = ifelse(boost_number < 3, 0, (hidden_charges - lag(hidden_charges)) / lag(hidden_charges) * 100),
+    hidden_charge_pct_increase = ifelse(is.na(hidden_charge_pct_increase), 0, hidden_charge_pct_increase)
+  ) %>%
+  select(c(trip_id, metro_area, trip_start_date, timestamp, hours_from_boost_to_ride,
+           boost_number, base_price, boost_amount, boost_pct_increase, boost_amount_pct_of_total, 
+           base_plus_boost, base_plus_boost, hidden_charges, hidden_charge_pct_increase, hidden_charge_pct_of_total, 
+           total_price, claimed, total_driver_supply))
+
+```
+
+
+<br>
+<br>
+
+
+## Genreral Exploration 
+<br>
+
+```{r}
+str(data)
+```
+
+<br>
+<br>
+
+```{r}
+summary(data)
+```
+
+* No missing values 
+* Two Timestamp elements that may need to be reshaped for later use 
+* Location is the only character element 
+* The "total price" appears to be greater than the "base_plus_boost", suggesting there is some sort of hidden fee 
+  + The hidden charge doesn't kick in until after the 2nd boost 
+
+
+**Next Steps:**  
+<br>
+
+* Add elements that allow us to explore the hidden fees 
+* Add elements that reveal how the various fees evolve throughout the boosting process 
+
+<br>
+<br>
+
+
+## Location Data EDA
+
+Summary table of aggregated location data
+<br>
+
+```{r, echo=FALSE}
+ # Breakout by location
+      location_summary = data_2 %>%
+        group_by(metro_area, trip_id) %>%
+        mutate(number_of_boosts = n() - 1,
+               final_price = max(total_price),
+               final_driver_suppy = total_driver_supply[boost_number==max(boost_number)],
+               avg_base_price = mean(base_price)
+               ) %>%
+        group_by(metro_area) %>%
+        summarise(total_trips = n(),
+                  avg_boosts = mean(number_of_boosts),
+                  avg_total_cost = mean(final_price ),
+                  avg_driver_supply = mean(final_driver_suppy),
+                  avg_base_price = mean(base_price)
+        )
+
+print(location_summary, n=15)
+```
+
+
+* Trips appear to be broken out uniformly across locations 
+* The average number of boosts seems uniform across locations 
+ 
+
+<br>
+<br>
+
+The average costs has very little fluctuation between markets
+
+```{r }
+ # Avg Base Price by Location
+        ggplot(location_summary, aes(x = reorder(metro_area, avg_base_price), y = avg_base_price)) +
+          geom_bar(stat = "identity", fill = "steelblue") +
+          coord_flip() +
+          labs(title = "Average Base Price by Metro Area",
+               x = "Metro Area",
+               y = "Average Base Price") +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+<br>
+
+
+```{r }
+        # Avg Final Cost by Location
+        ggplot(location_summary, aes(x = reorder(metro_area, avg_total_cost), y = avg_total_cost)) +
+          geom_bar(stat = "identity", fill = "steelblue") +
+          coord_flip() +
+          labs(title = "Average Total Cost by Metro Area",
+               x = "Metro Area",
+               y = "Average Total Cost") +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+<br>
+<br>
+
+
+The average driver supply has a decent amount of variance based on location 
+
+```{r }
+          # Driver Supply by Location
+          ggplot(location_summary, aes(x = reorder(metro_area, avg_driver_supply), y = avg_driver_supply)) +
+            geom_bar(stat = "identity", fill = "steelblue") +
+            coord_flip() +
+            labs(title = "Average Driver Supply by Metro Area",
+                 x = "Metro Area",
+                 y = "Average Driver Supply") +
+            theme_minimal() +
+            theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+<br>
+<br>
+
+
+The correlation in average driver supply and average total cost by metro area is fairly strong 
+
+```{r }
+         # correlation of cost and location
+          cor(location_summary$avg_driver_supply, location_summary$avg_total_cost)
+```
+
+<br>
+<br>
+<br>
+<br>
+
+\newpage 
+
+## Boost Data EDA
+
+<br>
+
+How many trips are in each boost count category? 
+
+```{r }
+# How many trips are in each boost count category?
+boost_count_summary_per_trip = trip_summary %>%
+  group_by(number_of_boosts) %>%
+  summarise(unique_trips = length(unique(trip_id)),
+            claimed_trips = sum(unclaimed_trip==0),
+            unclaimed_trips = sum(unclaimed_trip),
+            avg_starting_rate = mean(starting_rate),
+            avg_ending_rate = mean(ending_rate),
+            avg_price_change = mean(total_price_change),
+            avg_drivers_at_claim = mean(total_drives_when_claimed)
+  )
+
+
+print(boost_count_summary_per_trip, n=15)
+```
+
+
+* The number of boosts range from 0 to 10 
+* Trips are uniformly distributed across a breakout of number of boosts 
+* All of the trips that went unclaimed did not receive any boosting 
+* Similarly, trips were exclusively claimed after boosting (never before) 
+
+<br>
+<br>
+
+How are unclaimed trips distributed among the boost groups?  
+
+```{r }
+# How are unclaimed trips distributed among these groups?
+uncliamed_trip_summary = trip_summary %>%
+  group_by(number_of_boosts) %>% 
+  summarise(total_unclaimed = sum(unclaimed_trip))
+      # All unclaimed trips are 0 boosts
+
+print(uncliamed_trip_summary , n=11)
+```
+
+<br>
+<br>
+
+Not all of the boosts are positive. Negative boosts account for half of the total boosts.
+
+```{r}
+# What percent of all boosts were negative?
+negative_boosts = data_3 %>%
+  filter(boost_pct_increase != 0) %>%
+  mutate(positive_boost = ifelse(boost_pct_increase > 0, 1, 0)) %>%
+  group_by(positive_boost) %>%
+  summarise(total_claims = n()) %>%
+  mutate(percentage = total_claims / sum(total_claims) * 100)
+
+print(negative_boosts)
+```
+
+<br>
+<br>
+
+How many of the claimed trips were made after a negative boost? 
+
+```{r }
+# What is the breakout of claimed trips when the boost is negative vs positive?
+polarization_of_claimed_rides <- data_3 %>%
+  filter(claimed == 1) %>%
+  mutate(positive_boost = ifelse(boost_pct_increase > 0, 1, 0)) %>%
+  group_by(positive_boost) %>%
+  summarise(total_claims = n()) %>%
+  mutate(percentage = total_claims / sum(total_claims) * 100)
+        # 55% of the claimed rides are after a negative boost
+
+print(polarization_of_claimed_rides)
+```
+
+* This is a critical discovery. It appears that drivers are **MORE** likely to claim a ride after a negative boost that a positive boost. 
+
+
+<br>
+<br>
+
+At what step in the boosting series did negative boosting occur most often (if any)?
+
+```{r }
+# At what step in the boost series are negative boosts occurring?
+negative_boost_step = data_3 %>%
+  filter(boost_pct_increase != 0) %>%
+  mutate(positive_boost = ifelse(boost_pct_increase > 0, 1, 0)) %>%
+  group_by(boost_number) %>%
+  summarise(total_boosts = n(),
+            negative_boosts = sum(positive_boost == 0))
+
+negative_boost_step 
+```
+* The negative boosts seem to be distributed fairly consistently across the sequences at roughly 50% 
+
+<br>
+<br>
+
+At which step if any, do negative boosts seem to be most effective? 
+
+```{r }
+# Where do negative boosts seem to be most effective?
+negative_boost_step_claimed = data_3 %>%
+  filter(boost_pct_increase != 0) %>%
+  mutate(positive_boost = ifelse(boost_pct_increase > 0, 1, 0)) %>%
+  group_by(boost_number, claimed) %>%
+  summarise(total_boosts = n(),
+            negative_boosts = sum(positive_boost == 0),
+            percent_of_group = negative_boosts/total_boosts)
+
+print(negative_boost_step_claimed, n=20)
+```
+
+* The distribution of claimed rides after a negative boost appears to be uniformly distributed throughout the boosting sequence 
+
+
+<br>
+<br>
+
+
+Do consecutive negative boosts have a greater impact on acceptance? 
+
+```{r }
+# Does a double-negative boost have a greater impact on acceptance?
+
+consecutive_neg_boosting = data_3 %>%
+  mutate(initial_boost_decrease = ifelse(boost_number > 0 & 
+                                           boost_number == lag(boost_number) + 1 &
+                                           lag(boost_pct_increase) > 0 &
+                                           boost_pct_increase < 0,
+                                         1, 0),
+         consecutive_boost_decrease = ifelse(boost_number > 1 & 
+                                               boost_number == lag(boost_number) + 1 &
+                                               lag(boost_pct_increase) < 0 &
+                                               boost_pct_increase < 0,
+                                             1, 0),
+         boost_drop_status = case_when(
+           initial_boost_decrease == 1 ~ "initial_drop",
+           consecutive_boost_decrease == 1 ~ "consecutive_drop"
+         )
+      )
+
+
+consecutuve_neg_boosting_success = consecutive_neg_boosting %>%
+  filter(is.na(boost_drop_status) == FALSE) %>%
+  group_by(boost_drop_status) %>%
+  summarise(counts = n(),
+            claimed = sum(claimed),
+            percent_Claimed = claimed / counts)
+
+consecutuve_neg_boosting_success
+```
+
+* Both single boost decreases and consecutive boost decreases appear to have similar claim rates, suggesting that dropping a boost multiple times in a row has little to no effect on claim rates  
+
+
+
+\newpage
+<br>
+<br>
+<br>
+<br>
+
+# Knowledge Transfer - Modeling 
+
+Three independent models were created for testing and experimentation - two ML models and a basic linear optimization model. Given time constraints and the intention to discussing this documentation at a later date, I am providing code for what was completed here with the intention of explaining and summarizing in a live setting. 
+
+Any notes related to the reasoning for taking the approach will be provided here as well. 
+
+<br>
+<br>
+
+## Feature prepartation for Model 1
+
+The focus of Model 1 is to predict the likelihood of a boost to result in a claimed ride. The purpose is twofold: 
+
+1. Explore the viability of predicting claimed rides with these features  
+2. Observe the feature importance to see which elements carry the most predictive power  
+
+Basic concepts in practice were: 
+
+* Drop elements that will not or cannot be used in modeling  
+* Reformat the date fields to a numeric representation 
+* Convert the location into a numeric using the factor  
+* Using a tree-based core algorithm such as XGBoost means we: 
+  + Do not need to use 1-hot encoding for categorical variables like metro_area 
+  + Do not need to scale the features to a universal level, such as min/max  
+
+\newpage
+
+```{r}
+library(tidyverse)
+
+setwd("C:\\Users\\MichaelBrucek\\Desktop\\HSD Task")
+
+# Read Data ----
+data = read.csv("boost_df.csv")
+
+
+# Create Features and Clean Data
+claimed_ride_feature_set = data %>%
+  mutate(metro_area = as.numeric(as.factor(metro_area)),  # using xgboost so any number representation will do (no need for one hot)
+         trip_start_year = year(trip_start_date),
+         trip_start_month = month(trip_start_date),
+         trip_start_day = day(trip_start_date),
+         trip_start_hour = hour(trip_start_date),
+         trip_start_minute = minute(trip_start_date),
+         total_price_change = total_price - base_price,
+         total_price_pct_increase = ifelse(boost_number > 0, (total_price - lag(total_price)) / lag(total_price) * 100, 0),
+         hidden_charges = total_price - base_plus_boost,  # Reveal hidden charges (base + boost does not always == total_price)
+         boost_amount_pct_of_total = (boost_amount / total_price) * 100,
+         boost_pct_increase = ifelse(boost_number < 2, 0, (boost_amount - lag(boost_amount)) / lag(boost_amount) * 100),
+         boost_pct_increase = ifelse(is.na(boost_pct_increase), 0, boost_pct_increase),
+         # Hidden charge doesn't kick in until after the 2nd boost                            
+         hidden_charge_pct_of_total = (hidden_charges / total_price) * 100,
+         hidden_charge_pct_increase = ifelse(boost_number < 3, 0, (hidden_charges - lag(hidden_charges)) / lag(hidden_charges) * 100),
+         hidden_charge_pct_increase = ifelse(is.na(hidden_charge_pct_increase), 0, hidden_charge_pct_increase),
+         driver_supply_pct_increase = ifelse(boost_number > 0, (total_driver_supply - lag(total_driver_supply)) / lag(total_driver_supply) * 100, 0)
+    
+  ) %>%
+  # reorder for easier interpretation
+  select(# Trip metadata
+         trip_id, claimed, metro_area, 
+         trip_start_year, trip_start_month, trip_start_day, trip_start_hour, trip_start_minute,
+         # High level price info
+         base_price, total_price, total_price_change, total_price_pct_increase,
+         # Boost info
+         boost_number, boost_amount, boost_pct_increase, boost_amount_pct_of_total, 
+         # Hidden charge info
+         hidden_charges, hidden_charge_pct_increase, hidden_charge_pct_of_total,
+         # Driver supply info
+         total_driver_supply, driver_supply_pct_increase)
+
+```
+
+<br>
+<br>
+<br>
+
+##  Model 1 - Creation and Execution
+
+The data used comes from a prepared feature set, with the trip_id column removed since it's not relevant for modeling. To evaluate the importance of features later on, we add a random noise feature as a benchmark. Any features adding less value than a random number can be considered irrelevant.
+
+
+```{r }
+
+# Setup Environment ----
+library(xgboost)
+library(caret)
+library(Metrics)
+
+
+# Load data from feature prep
+df = claimed_ride_feature_set
+
+df = df %>% select(-c(trip_id)) # not a modeling feature
+
+```
+
+<br>
+<br>
+
+Next, we split the data into training, testing, and validation sets, with 80% of the data used for training and 10% each for testing and validation. This ensures that we have separate sets for training the model and evaluating performance without bias.
+
+```{r}
+# Add a "random noise" feature as benchmark for feature gain evaluation
+df$random_noise <- runif(nrow(df), min=.001, max=5) # Uniform random values between .01 and 5
+
+
+# Split data into Train, Test, and Validation sets (80%, 10%, 10%)
+trainIndex <- createDataPartition(df$claimed, p = 0.8, 
+                                  list = FALSE, 
+                                  times = 1)
+
+dfTrain <- df[trainIndex, ]
+temp <- df[-trainIndex, ]
+
+testIndex <- createDataPartition(temp$claimed, p = 0.5, 
+                                 list = FALSE, 
+                                 times = 1)
+
+dfTest <- temp[testIndex, ]
+dfValidation <- temp[-testIndex, ]
+
+```
+
+<br>
+<br>
+
+To prepare for using XGBoost, we convert our data into the matrix format required. This separates the features from the target variable, which is the claimed status in our case.
+
+
+```{r}
+
+# Prepare matrix formatting for XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(dfTrain %>% select(-claimed)), label = dfTrain$claimed)
+dtest <- xgb.DMatrix(data = as.matrix(dfTest %>% select(-claimed)), label = dfTest$claimed)
+dvalidation <- xgb.DMatrix(data = as.matrix(dfValidation %>% select(-claimed)), label = dfValidation$claimed)
+
+```
+
+<br>
+<br>
+
+The core of this process involves hyperparameter tuning, which is crucial for optimizing the model's performance. We run 100 iterations, randomly selecting different sets of parameters each time. For each set of parameters, we train the model and evaluate its performance using the Mean Absolute Error (MAE) on the validation set. The goal is to find the set of parameters that results in the lowest MAE, indicating the best performance.
+
+This process took about 15 minutes to train on my hardware. 
+
+
+```{r results='hide'}
+
+
+# Hyperparameter Tuning ----
+
+# set.seed(414) 
+best_mae <- Inf
+best_params <- list()
+
+for(i in 1:100) { # Run 100 iterations
+  
+  sample_params <- list(
+    booster = "gbtree",
+    objective = "binary:logistic",
+    eta = runif(1, 0.01, 0.3),
+    gamma = runif(1, 0, 5),
+    max_depth = sample(3:20, 1),
+    subsample = runif(1, 0.5, 1),
+    colsample_bytree = runif(1, 0.5, 1),
+    min_child_weight = runif(1, 1, 5)
+  )
+  
+  model <- xgb.train(params = sample_params, 
+                     data = dtrain, 
+                     nrounds = 140,
+                     watchlist = list(train = dtrain, test = dtest),
+                     early_stopping_rounds = 10,
+                     print_every_n = 10,
+                     silent = 1)
+  
+  preds <- predict(model, dvalidation)
+  current_mae <- mae(dfValidation$total_price, preds)
+  
+  if(current_mae < best_mae) {
+    best_mae <- current_mae
+    best_params <- sample_params
+  }
+}
+
+```
+
+<br>
+<br>
+
+After identifying the best parameters, we use the final model to make predictions on the validation set. We also extract and record the details of the best hyperparameters.
+
+
+```{r}
+
+# Prediction on validation set
+preds <- predict(model, dvalidation)
+
+
+# Get the tuning details
+hyperparameters = model$params
+hyperparameters_df <- data.frame(hyperparameter = names(hyperparameters), value = unlist(hyperparameters))
+
+
+```
+
+<br>
+<br>
+
+Finally, we are in a position to evaluate performance. First we calculate the mean absolute error to assess its accuracy.
+
+```{r} 
+# Get Mean Absolute Error of the validation preds
+mae <- mae(dfValidation$claimed, preds)
+print(paste("Mean Absolute Error on Validation Set:", mae))
+```
+
+<br>
+<br>
+
+Since we are treating this as a classification problem, a confusion matrix that helps us understand the performance by showing the actual versus predicted classifications. 
+
+```{r} 
+
+# Confusion Matrix
+
+
+# Prediction on validation set
+preds_class <- ifelse(preds > 0.5, 1, 0)
+
+conf_matrix <- confusionMatrix(as.factor(preds_class), as.factor(dfValidation$claimed))
+
+print(conf_matrix)
+
+```
+
+<br>
+<br>
+
+The ROC curve and AUC score are useful for evaluating the performance of a binary classifier.
+
+
+```{r}
+library(pROC)
+
+# ROC Curve
+roc_curve <- roc(dfValidation$claimed, preds)
+plot(roc_curve, main="ROC Curve", col="blue", lwd=2)
+
+```
+```{r}
+
+# AUC
+auc_score <- auc(roc_curve)
+
+print(paste("AUC:", auc_score))
+```
+
+<br>
+<br>
+
+To understand which features are most important in our model, we analyze the feature importance, focusing on their contribution to the model's gain. This helps us see which features have the most significant impact on the predictions. I've also set up a visual for this so we can talk about the results when we meet.
+
+```{r}
+# Assess feature importance
+importance_matrix <- xgb.importance(feature_names = colnames(dfTrain %>% select(-claimed)), model = model)
+#plot
+
+xgb.plot.importance(importance_matrix, measure = "Gain") # Features listed by Gain
+
+
+```
+
+<br>
+<br>
+
+Finally, we save the trained model for future use.
+
+```{r}
+
+# Save the final model
+saveRDS(model, "pred_claimed_ride.rds")
+
+```
+
+
